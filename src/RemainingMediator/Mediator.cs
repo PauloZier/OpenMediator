@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Concurrent;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -9,12 +11,15 @@ public class Mediator : IMediator
 {
     private readonly IServiceProvider _serviceProvider;
 
+    private static readonly ConcurrentDictionary<Type, Type> RequestHandlerDictionary = new();
+    private static readonly ConcurrentDictionary<Type, MethodInfo> MethodInfoDictionary = new();
+
     public Mediator(IServiceProvider serviceProvider)
     {
         _serviceProvider = serviceProvider;
     }
 
-    public Task PublishAsync<TNotification>(TNotification notification, CancellationToken cancellationToken = default) 
+    public Task PublishAsync<TNotification>(TNotification notification, CancellationToken cancellationToken = default)
         where TNotification : INotification
     {
         var handlers = _serviceProvider.GetServices<INotificationHandler<TNotification>>() ?? [];
@@ -23,7 +28,7 @@ public class Mediator : IMediator
         return Task.WhenAll(tasks);
     }
 
-    public Task SendAsync<TRequest>(TRequest request, CancellationToken cancellationToken = default) 
+    public Task SendAsync<TRequest>(TRequest request, CancellationToken cancellationToken = default)
         where TRequest : IRequest
     {
         var handler = _serviceProvider.GetRequiredService<IRequestHandler<TRequest>>();
@@ -33,19 +38,20 @@ public class Mediator : IMediator
     public async Task<TResponse> SendAsync<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
     {
         var requestType = request.GetType();
-        var handlerType = typeof(IRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse));
+        var handlerType = RequestHandlerDictionary.GetOrAdd(requestType, requestType
+            => typeof(IRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse)));
 
-        var handlerObj = _serviceProvider.GetService(handlerType);
-        if (handlerObj == null)
+        var handler = _serviceProvider.GetService(handlerType);
+        if (handler == null)
             throw new InvalidOperationException($"Handler not found for {requestType.Name}");
 
-        var method = handlerType.GetMethod("HandleAsync");
-        if (method == null)
-            throw new InvalidOperationException($"HandleAsync method not found in {handlerType.Name}");
+        var handlerMethod = MethodInfoDictionary.GetOrAdd(handlerType, handlerType
+            => handlerType.GetMethod(nameof(IRequestHandler<IRequest<TResponse>, TResponse>.HandleAsync), [requestType, typeof(CancellationToken)])!);
 
-        if (method.Invoke(handlerObj, [request, cancellationToken]) is not Task<TResponse> task)
-            throw new InvalidOperationException(
-                $"Handler {handlerObj.GetType().Name} returned null or an incompatible type.");
+        if (handlerMethod == null) throw new InvalidOperationException($"HandleAsync method not found in {handlerType.Name}");
+
+        if (handlerMethod.Invoke(handler, [request, cancellationToken]) is not Task<TResponse> task)
+            throw new InvalidOperationException($"Handler {handler.GetType().Name} returned null or an incompatible type.");
 
         return await task;
     }
